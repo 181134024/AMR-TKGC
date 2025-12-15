@@ -21,7 +21,6 @@ def free_params(module: nn.Module):
 
 
 
-
 class Runner(object):
 
     def load_data(self):
@@ -33,20 +32,22 @@ class Runner(object):
                 rel_text = self.rel_names[rel]
             else:
                 rel_text = 'reversed: ' + self.rel_names[rel - self.p.num_rel]
-            
             tokenized_text = self.tok(sub_text, text_pair=rel_text, max_length=self.p.text_len-1, truncation=True)
-            source_ids = tokenized_text.input_ids  
-            source_mask = tokenized_text.attention_mask  
-            
+            source_ids = tokenized_text.input_ids
+            source_mask = tokenized_text.attention_mask
             source_ids.insert(-1, self.mask_token_id)
             source_mask.insert(-1, 1)
             return source_ids, source_mask
-        data_path = os.path.join(os.path.dirname(__file__), 'data', self.p.dataset)
-        
-        ent_id2name = read_file(os.path.join(os.path.dirname(__file__), 'data'), self.p.dataset, 'entityid2name.txt', 'name')
-        rel_id2name = read_file(os.path.join(os.path.dirname(__file__), 'data'), self.p.dataset, 'relationid2name.txt', 'name')
+        base_dir = os.path.dirname(__file__)
+        data_dir = os.path.join(base_dir, 'data', self.p.dataset)
+        fallback_dir = os.path.join(base_dir, 'data', 'ProcKG')
+        use_fallback = not os.path.isdir(data_dir)
+        data_path = data_dir if not use_fallback else fallback_dir
+        name_base = os.path.join(base_dir, 'data') if not use_fallback else os.path.join(base_dir, 'data')
+        dataset_key = self.p.dataset if not use_fallback else ''
+        ent_id2name = read_file(name_base, dataset_key, 'entityid2name.txt', 'name')
+        rel_id2name = read_file(name_base, dataset_key, 'relationid2name.txt', 'name')
 
-        
         self.ent2id = {name.lower(): idx for idx, name in enumerate(ent_id2name)}
         self.rel2id = {name.lower(): idx for idx, name in enumerate(rel_id2name)}
         self.rel2id.update({(name.lower() + '_reverse'): idx + len(self.rel2id) for idx, name in enumerate(rel_id2name)})
@@ -61,68 +62,157 @@ class Runner(object):
         self.data = ddict(list)
         sr2o = ddict(set)
 
-        
         for split in ['train', 'test', 'valid']:
-            for line in open(os.path.join(data_path, f'{split}.txt'), encoding='utf-8'):
-                sub, rel, obj = map(str.lower, line.strip().split('\t'))
-                sub, rel, obj = self.ent2id[sub], self.rel2id[rel], self.ent2id[obj]
-                self.data[split].append((sub, rel, obj))
+            id_path = os.path.join(data_path, f'{split}2id.txt')
+            txt_path = os.path.join(data_path, f'{split}.txt')
+            name_path = os.path.join(data_path, f'{split}2id_name.txt')
+            
+            loaded = False
+            # First try ID format (space or tab separated)
+            if os.path.exists(id_path):
+                lines = open(id_path, encoding='utf-8')
+                for line in lines:
+                    line = line.strip()
+                    if not line or line.isdigit():  # Skip header line (count)
+                        continue
+                    # Try space-separated first, then tab-separated
+                    if ' ' in line:
+                        parts = line.split()
+                    else:
+                        parts = line.split('\t')
+                    if len(parts) != 3:
+                        continue
+                    try:
+                        sub_id, obj_id, rel_id = int(parts[0]), int(parts[1]), int(parts[2])
+                        # Validate IDs are within range
+                        if 0 <= sub_id < self.p.num_ent and 0 <= obj_id < self.p.num_ent and 0 <= rel_id < self.p.num_rel:
+                            self.data[split].append((sub_id, rel_id, obj_id))
+                            loaded = True
+                    except ValueError:
+                        continue
+            # Then try name format (tab-separated)
+            elif os.path.exists(txt_path):
+                lines = open(txt_path, encoding='utf-8')
+                for line in lines:
+                    parts = line.strip().split('\t')
+                    if len(parts) != 3:
+                        continue
+                    sub, rel, obj = map(str.lower, parts)
+                    if sub not in self.ent2id or rel not in self.rel2id or obj not in self.ent2id:
+                        continue
+                    self.data[split].append((self.ent2id[sub], self.rel2id[rel], self.ent2id[obj]))
+                    loaded = True
+            # Finally try name format with pipe separator
+            elif os.path.exists(name_path):
+                lines = open(name_path, encoding='utf-8')
+                for line in lines:
+                    if not line.strip() or ('|' not in line):
+                        continue
+                    parts = [p.strip().lower() for p in line.strip().split('|')]
+                    if len(parts) != 3:
+                        continue
+                    sub, obj, rel = parts[0], parts[1], parts[2]
+                    if sub in self.ent2id and rel in self.rel2id and obj in self.ent2id:
+                        self.data[split].append((self.ent2id[sub], self.rel2id[rel], self.ent2id[obj]))
+                        loaded = True
+            # Ensure split key exists even if no data was loaded
+            if split not in self.data:
+                self.data[split] = []
+            if loaded:
+                print(f"[Data Loading] Loaded {len(self.data[split])} {split} samples from {id_path if os.path.exists(id_path) else (txt_path if os.path.exists(txt_path) else name_path)}")
 
-                if split == 'train':
-                    sr2o[(sub, rel)].add(obj)
-                    sr2o[(obj, rel + self.p.num_rel)].add(sub)
 
 
-        
         self.data = dict(self.data)
-        
+        # Print data loading statistics
+        print(f"[Data Loading] Loaded data counts: train={len(self.data.get('train', []))}, "
+              f"test={len(self.data.get('test', []))}, valid={len(self.data.get('valid', []))}")
         
         self.sr2o = {k: list(v) for k, v in sr2o.items()}
+        for sub, rel, obj in self.data.get('train', []):
+            sr2o[(sub, rel)].add(obj)
+            sr2o[(obj, rel + self.p.num_rel)].add(sub)
         for split in ['test', 'valid']:
-            for sub, rel, obj in self.data[split]:
+            for sub, rel, obj in self.data.get(split, []):
                 sr2o[(sub, rel)].add(obj)
                 sr2o[(obj, rel + self.p.num_rel)].add(sub)
 
         self.sr2o_all = {k: list(v) for k, v in sr2o.items()}
 
-        
-        self.ent_names = read_file(os.path.join(os.path.dirname(__file__), 'data'), self.p.dataset, 'entityid2name.txt', 'name')
-        self.rel_names = read_file(os.path.join(os.path.dirname(__file__), 'data'), self.p.dataset, 'relationid2name.txt', 'name')
-        self.ent_descs = read_file(os.path.join(os.path.dirname(__file__), 'data'), self.p.dataset, 'entityid2description.txt', 'desc')
-        if self.p.pretrained_model_name.lower() == 'bert_base' or self.p.pretrained_model_name.lower() == 'bert_large':
-            self.tok = BertTokenizer.from_pretrained(self.p.pretrained_model, add_prefix_space=False)
-            triples_save_file_name = 'bert'
-        elif self.p.pretrained_model_name.lower() == 'roberta_base' or self.p.pretrained_model_name.lower() == 'roberta_large':
-            self.tok = RobertaTokenizer.from_pretrained(self.p.pretrained_model, add_prefix_space=True)
-            triples_save_file_name = 'roberta'
+        self.ent_names = read_file(name_base, dataset_key, 'entityid2name.txt', 'name')
+        self.rel_names = read_file(name_base, dataset_key, 'relationid2name.txt', 'name')
+        self.ent_descs = read_file(name_base, dataset_key, 'entityid2description.txt', 'desc')
+        triples_save_file_name = 'bert'
+        if not getattr(self.p, 'disable_plm', False):
+            if self.p.pretrained_model_name.lower() == 'bert_base' or self.p.pretrained_model_name.lower() == 'bert_large':
+                self.tok = BertTokenizer.from_pretrained(self.p.pretrained_model, add_prefix_space=False)
+                triples_save_file_name = 'bert'
+            elif self.p.pretrained_model_name.lower() == 'roberta_base' or self.p.pretrained_model_name.lower() == 'roberta_large':
+                self.tok = RobertaTokenizer.from_pretrained(self.p.pretrained_model, add_prefix_space=True)
+                triples_save_file_name = 'roberta'
 
-        triples_save_file = os.path.join(os.path.dirname(__file__), 'data', self.p.dataset, '{}_{}.txt'.format('loaded_triples', triples_save_file_name))
+        triples_save_root = os.path.join(base_dir, 'data', self.p.dataset)
+        if not os.path.isdir(triples_save_root):
+            triples_save_root = os.path.join(base_dir, 'data', 'ProcKG')
+        triples_save_file = os.path.join(triples_save_root, '{}_{}.txt'.format('loaded_triples', triples_save_file_name))
 
         if os.path.exists(triples_save_file):
             self.triples = json.load(open(triples_save_file, encoding='utf-8'))
-        else:
+            # Ensure all required keys exist
+            if 'train' not in self.triples:
+                self.triples['train'] = []
+            for split in ['test', 'valid']:
+                for suffix in ['tail', 'head']:
+                    key = '{}_{}'.format(split, suffix)
+                    if key not in self.triples:
+                        self.triples[key] = []
+            # Check if training data is empty
+            if len(self.triples.get('train', [])) == 0:
+                print(f"[Warning] Loaded triples file exists but 'train' is empty. Regenerating triples...")
+                # Delete the empty file and regenerate
+                os.remove(triples_save_file)
+                self.triples = ddict(list)
+            else:
+                print(f"[Info] Loaded triples from file: train={len(self.triples.get('train', []))} samples")
+        
+        if not os.path.exists(triples_save_file) or len(self.triples.get('train', [])) == 0:
             self.triples = ddict(list)
-            for sub, rel, obj in tqdm(self.data['train']):
-                text_ids, text_mask = construct_input_text(sub, rel)
-                self.triples['train'].append({'triple': (sub, rel, -1), 'label': [obj], 'sub_samp': 1, 'text_ids': text_ids, 'text_mask': text_mask, 'pred_pos': text_ids.index(self.mask_token_id)})
+            for sub, rel, obj in tqdm(self.data.get('train', [])):
+                if getattr(self.p, 'disable_plm', False):
+                    text_ids, text_mask, pred_pos = [], [], 0
+                else:
+                    text_ids, text_mask = construct_input_text(sub, rel)
+                    pred_pos = text_ids.index(self.mask_token_id)
+                self.triples['train'].append({'triple': (sub, rel, -1), 'label': [obj], 'sub_samp': 1, 'text_ids': text_ids, 'text_mask': text_mask, 'pred_pos': pred_pos})
                 rel_inv = rel + self.p.num_rel
-                text_ids, text_mask = construct_input_text(obj, rel_inv)
-                self.triples['train'].append(
-                {'triple': (obj, rel_inv, -1), 'label': [sub], 'sub_samp': 1, 'text_ids': text_ids, 'text_mask': text_mask, 'pred_pos': text_ids.index(self.mask_token_id)})
+                if getattr(self.p, 'disable_plm', False):
+                    text_ids, text_mask, pred_pos = [], [], 0
+                else:
+                    text_ids, text_mask = construct_input_text(obj, rel_inv)
+                    pred_pos = text_ids.index(self.mask_token_id)
+                self.triples['train'].append({'triple': (obj, rel_inv, -1), 'label': [sub], 'sub_samp': 1, 'text_ids': text_ids, 'text_mask': text_mask, 'pred_pos': pred_pos})
 
             for split in ['test', 'valid']:
-                for sub, rel, obj in tqdm(self.data[split]):
-                    text_ids, text_mask = construct_input_text(sub, rel)
+                for sub, rel, obj in tqdm(self.data.get(split, [])):
+                    if getattr(self.p, 'disable_plm', False):
+                        text_ids, text_mask, pred_pos = [], [], 0
+                    else:
+                        text_ids, text_mask = construct_input_text(sub, rel)
+                        pred_pos = text_ids.index(self.mask_token_id)
                     self.triples['{}_{}'.format(split, 'tail')].append(
-                        {'triple': (sub, rel, obj), 'label': self.sr2o_all[(sub, rel)], 'text_ids': text_ids, 'text_mask': text_mask, 'pred_pos': text_ids.index(self.mask_token_id)})
+                        {'triple': (sub, rel, obj), 'label': self.sr2o_all[(sub, rel)], 'text_ids': text_ids, 'text_mask': text_mask, 'pred_pos': pred_pos})
 
 
                     rel_inv = rel + self.p.num_rel
 
-                    text_ids, text_mask = construct_input_text(obj, rel_inv)
+                    if getattr(self.p, 'disable_plm', False):
+                        text_ids, text_mask, pred_pos = [], [], 0
+                    else:
+                        text_ids, text_mask = construct_input_text(obj, rel_inv)
+                        pred_pos = text_ids.index(self.mask_token_id)
                     self.triples['{}_{}'.format(split, 'head')].append(
                         {'triple': (obj, rel_inv, sub), 'label': self.sr2o_all[(obj, rel_inv)], 'text_ids': text_ids,
-                         'text_mask': text_mask, 'pred_pos': text_ids.index(self.mask_token_id)})
+                         'text_mask': text_mask, 'pred_pos': pred_pos})
 
 
                 print('{}_{} num is {}'.format(split, 'tail', len(self.triples['{}_{}'.format(split, 'tail')])))
@@ -131,10 +221,18 @@ class Runner(object):
 
             self.triples = dict(self.triples)
             json.dump(self.triples, open(triples_save_file, 'w'))
+            print(f"[Info] Generated triples: train={len(self.triples.get('train', []))} samples")
+
+        # Validate training data
+        train_samples = len(self.triples.get('train', []))
+        if train_samples == 0:
+            raise ValueError(f"No training data found! Check data files in {data_path}. "
+                           f"Loaded data splits: {list(self.data.keys())}, "
+                           f"Data counts: {[(k, len(v)) for k, v in self.data.items()]}")
 
         def get_data_loader(dataset_class, split, batch_size, shuffle=True):
             return DataLoader(
-                dataset_class(self.triples[split], self.p),
+                dataset_class(self.triples.get(split, []), self.p),
                 batch_size=batch_size,
                 shuffle=shuffle,
                 num_workers=max(0, self.p.num_workers),
@@ -157,9 +255,7 @@ class Runner(object):
             '{}_{} num is {}\n'.format('valid', 'tail', len(self.triples['{}_{}'.format('valid', 'tail')])))
         self.edge_index, self.edge_type = self.construct_adj()
         
-        
         self.enable_type_aware = getattr(self.p, 'enable_type_aware', False)
-        
         self.type_aware_nonintrusive = getattr(self.p, 'type_aware_nonintrusive', False)
         self.type_soft_constraint = getattr(self.p, 'type_soft_constraint', False)
         effective_mask_mode = getattr(self.p, 'type_mask_mode', 'auto')
@@ -182,24 +278,19 @@ class Runner(object):
             prior_zero_mean=getattr(self.p, 'type_prior_zero_mean', True),
             mask_mode=effective_mask_mode,
             mask_penalty=getattr(self.p, 'type_mask_penalty', 1.0),
-            
         )
-        
         
         if self.enable_type_aware:
             self.type_aware_module.build_relation_candidate_mask(self.sr2o)
             print(f"[Type-Aware] Relation candidate mask built with shape: {self.type_aware_module.rel_candidate_mask.shape}")
-            
             if self.type_aware_module.rel_candidate_density is not None:
                 dens = self.type_aware_module.rel_candidate_density
                 print(f"[Type-Aware] Candidate density: mean={dens.mean().item():.4f}, median={dens.median().item():.4f}, min={dens.min().item():.4f}, max={dens.max().item():.4f}")
-            
             self.type_aware_module.build_relation_prior(self.sr2o)
             if self.type_aware_module.rel_prior_probs is not None:
                 print(f"[Type-Aware] Relation prior built with shape: {self.type_aware_module.rel_prior_probs.shape}, mode={self.type_aware_module.prior_mode}, alpha={self.type_aware_module.prior_alpha}, tau={self.type_aware_module.prior_tau}, zero_mean={self.type_aware_module.prior_zero_mean}")
                 print(f"[Type-Aware] Mask config: mode={self.type_aware_module.mask_mode}, penalty={self.type_aware_module.mask_penalty}")
                 print(f"[Type-Aware] NonIntrusive={self.type_aware_nonintrusive}, SoftConstraint={self.type_soft_constraint}")
-            
             self.type_aware_module.build_relation_prior(self.sr2o)
             if self.type_aware_module.rel_prior_probs is not None:
                 print(f"[Type-Aware] Relation prior built with shape: {self.type_aware_module.rel_prior_probs.shape}, mode={self.type_aware_module.prior_mode}, alpha={self.type_aware_module.prior_alpha}, tau={self.type_aware_module.prior_tau}, zero_mean={self.type_aware_module.prior_zero_mean}")
@@ -213,11 +304,9 @@ class Runner(object):
             edge_index.append((sub, obj))
             edge_type.append(rel)
 
-        
         for sub, rel, obj in self.data['train']:
             edge_index.append((obj, sub))
             edge_type.append(rel + self.p.num_rel)
-        
         edge_index = torch.LongTensor(edge_index).to(self.device).t()
         edge_type = torch.LongTensor(edge_type).to(self.device)
 
@@ -227,7 +316,6 @@ class Runner(object):
 
         self.p = params
 
-        
         use_gpu = torch.cuda.is_available() and isinstance(self.p.gpu, int) and self.p.gpu >= 0
         if use_gpu:
             self.device = torch.device(f'cuda:{self.p.gpu}')
@@ -236,8 +324,9 @@ class Runner(object):
         else:
             self.device = torch.device('cpu')
 
-        
-        if self.p.pretrained_model_name.lower() == 'bert_base' or self.p.pretrained_model_name.lower() == 'bert_large':
+        if getattr(self.p, 'disable_plm', False):
+            self.mask_token_id = 0
+        elif self.p.pretrained_model_name.lower() == 'bert_base' or self.p.pretrained_model_name.lower() == 'bert_large':
             self.mask_token_id = 103
         elif self.p.pretrained_model_name.lower() == 'roberta_base' or self.p.pretrained_model_name.lower() == 'roberta_large':
             self.mask_token_id = 50264
@@ -261,39 +350,26 @@ class Runner(object):
 
 
     def add_model(self, model):
+        """
+        Creates the computational graph
 
-        
+        Parameters
+        ----------
+        model_name:     Contains the model name to be created
 
-        
-        
-        
-        
-        
-        
+        Returns
+        -------
+        Creates the computational graph for model and initializes it
 
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
+        """
 
         model_name = model
 
         if model_name.lower() == 'disenkgat':
             model = DisenCSPROM(self.edge_index, self.edge_type, params=self.p)
-        elif model_name.lower() == 'dynamic_multihop':
-            from adaptive_multihop import DynamicMultiHopPDKGC
-            model = DynamicMultiHopPDKGC(self.edge_index, self.edge_type, params=self.p)
+        elif model_name.lower() == 'adaptive_multihop':
+            from adaptive_multihop import AdaptiveMultiHopPDKGC
+            model = AdaptiveMultiHopPDKGC(self.edge_index, self.edge_type, params=self.p)
         elif model_name.lower() == 'pretrained_disenkgat':
             if self.p.dataset =='FB15k-237':
                 model_save_path = '/home/zjlab/gengyx/KGE/DisenKGAT-2023/checkpoints/ConvE_FB15k_K4_D200_club_b_mi_drop_200d_08_09_2023_19:21:24'
@@ -316,21 +392,16 @@ class Runner(object):
 
 
         mi_disc_params = list(map(id, model.mi_Discs.parameters()))
-        
         rest_params = [p for p in model.parameters() if id(p) not in mi_disc_params and p.requires_grad]
-        
         if len(rest_params) == 0:
             rest_params = [p for p in model.parameters() if id(p) not in mi_disc_params]
-        
         if len(rest_params) == 0:
             rest_params = [p for p in model.parameters() if p.requires_grad]
-        
         if len(rest_params) == 0:
             rest_params = list(model.parameters())
         mi_params = [p for p in model.mi_Discs.parameters() if p.requires_grad]
         if len(mi_params) == 0:
             mi_params = list(model.mi_Discs.parameters())
-        
         named_params = [(n, p) for (n, p) in model.named_parameters() if id(p) not in mi_disc_params]
         no_decay_keywords = ['bias', 'LayerNorm.weight', 'LayerNorm.bias', 'bn.weight', 'bn.bias', 'norm.weight', 'norm.bias']
         decay_group = [p for (n, p) in named_params if p.requires_grad and not any(k in n for k in no_decay_keywords)]
@@ -370,7 +441,6 @@ class Runner(object):
     def load_model(self, load_path):
         state = torch.load(load_path, map_location=self.device)
         state_dict = state.get('state_dict', state)
-        
         model_dict = self.model.state_dict()
         compatible_state = {}
         skipped_keys = []
@@ -381,7 +451,6 @@ class Runner(object):
                 skipped_keys.append(k)
         missing_before = [k for k in model_dict.keys() if k not in compatible_state]
         load_res = self.model.load_state_dict(compatible_state, strict=False)
-        
         if 'best_val_mrr' in state:
             try:
                 self.best_val_mrr[self.p.load_type] = state['best_val_mrr']
@@ -391,13 +460,11 @@ class Runner(object):
             self.best_epoch[self.p.load_type] = self.p.load_epoch
         except Exception:
             pass
-        
         try:
             if 'optimizer' in state and hasattr(self, 'optimizer') and self.optimizer is not None:
                 self.optimizer.load_state_dict(state['optimizer'])
         except Exception as e:
             print(f"[Warn] Optimizer state not loaded: {e}")
-        
         print(f"[Info] Loaded params: {len(compatible_state)}/{len(model_dict)}; Skipped: {len(skipped_keys)}; Missing in checkpoint: {len(load_res.missing_keys)}; Unexpected ignored: {len(skipped_keys)}")
         if len(skipped_keys) > 0:
             print(f"[Info] Examples of skipped keys: {skipped_keys[:5]}")
@@ -405,37 +472,28 @@ class Runner(object):
 
     def evaluate(self, split, epoch):
 
-        
         left_results = self.predict(split=split, mode='tail_batch')
         right_results = self.predict(split=split, mode='head_batch')
         
         if self.enable_type_aware and len(left_results) == 7:
-            
             left_combine_results, left_struc_results, left_lm_results, left_base_combine, left_base_struc, left_base_lm, left_stats = left_results
             right_combine_results, right_struc_results, right_lm_results, right_base_combine, right_base_struc, right_base_lm, right_stats = right_results
-            
             
             log_combine_res, combine_results = get_and_print_combined_results(left_combine_results, right_combine_results)
             log_struc_res, struc_results = get_and_print_combined_results(left_struc_results, right_struc_results)
             log_lm_res, lm_results = get_and_print_combined_results(left_lm_results, right_lm_results)
             
-            
             log_base_combine_res, base_combine_results = get_and_print_combined_results(left_base_combine, right_base_combine)
             log_base_struc_res, base_struc_results = get_and_print_combined_results(left_base_struc, right_base_struc)
             log_base_lm_res, base_lm_results = get_and_print_combined_results(left_base_lm, right_base_lm)
             
-            
             all_stats = left_stats + right_stats
             coverage_stats = self.type_aware_module.get_coverage_stats(all_stats)
-            
             
             if getattr(self.p, 'type_aware_nonintrusive', False):
                 print('[Evaluating Epoch {} {}]: \n COMBINE results (Baseline) {}'.format(epoch, split, log_base_combine_res))
             else:
                 print('[Evaluating Epoch {} {}]: \n COMBINE results (Type-Aware) {}'.format(epoch, split, log_combine_res))
-            print('Structure Results (Type-Aware) {}'.format(log_struc_res))
-            print('LM Results (Type-Aware) {}'.format(log_lm_res))
-            
             
             if getattr(self.p, 'report_type_aware_effect', True):
                 baseline_results = {
@@ -447,7 +505,6 @@ class Runner(object):
                                                               {'combine': combine_results, 'structure': struc_results, 'lm': lm_results},
                                                               baseline_results)
         else:
-            
             left_combine_results, left_struc_results, left_lm_results = left_results
             right_combine_results, right_struc_results, right_lm_results = right_results
             
@@ -456,8 +513,6 @@ class Runner(object):
             log_lm_res, lm_results = get_and_print_combined_results(left_lm_results, right_lm_results)
             
             print('[Evaluating Epoch {} {}]: \n COMBINE results {}'.format(epoch, split, log_combine_res))
-            print('Structure Results {}'.format(log_struc_res))
-            print('LM Results {}'.format(log_lm_res))
 
         return combine_results, struc_results, lm_results
 
@@ -469,27 +524,25 @@ class Runner(object):
             combine_results = {}
             lm_results = {}
             struc_results = {}
-            
             base_combine_results = {}
             base_lm_results = {}
             base_struc_results = {}
-            
             type_aware_stats_list = []
             train_iter = iter(self.data_iter['{}_{}'.format(split, mode.split('_')[0])])
 
             for step, batch in enumerate(train_iter):
                 sub, rel, obj, label, text_ids, text_mask, pred_pos = self.read_batch(batch, split)
+                if getattr(self.p, 'disable_plm', False):
+                    text_ids, text_mask, pred_pos = None, None, None
                 pred, output, _ = self.model.forward(sub, rel, text_ids, text_mask, pred_pos, split)
                 b_range = torch.arange(pred.size()[0], device=self.device)
                 target_output = output[b_range, obj]
                 target_pred = pred[b_range, obj]
-                
-                pred = torch.where(label.byte(), -torch.ones_like(pred) * 1e9, pred) 
-                output = torch.where(label.byte(), -torch.ones_like(output) * 1e9, output) 
+                pred = torch.where(label.byte(), -torch.ones_like(pred) * 1e9, pred)
+                output = torch.where(label.byte(), -torch.ones_like(output) * 1e9, output)
                 output[b_range, obj] = target_output
                 pred[b_range, obj] = target_pred
 
-                
                 struc_ranks_base = 1 + torch.argsort(torch.argsort(pred, dim=1, descending=True), dim=1, descending=False)[b_range, obj]
                 lm_ranks_base = 1 + torch.argsort(torch.argsort(output, dim=1, descending=True), dim=1, descending=False)[b_range, obj]
                 
@@ -497,7 +550,6 @@ class Runner(object):
                 lm_ranks_base = lm_ranks_base.float()
                 combine_ranks_base = torch.min(torch.stack([struc_ranks_base, lm_ranks_base], dim=1), dim=1)[0]
                 combine_ranks_base = combine_ranks_base.float()
-                
                 
                 base_combine_results['count'] = torch.numel(combine_ranks_base) + base_combine_results.get('count', 0.0)
                 base_combine_results['mr'] = torch.sum(combine_ranks_base).item() + base_combine_results.get('mr', 0.0)
@@ -517,13 +569,11 @@ class Runner(object):
                 for k in range(10):
                     base_lm_results['hits@{}'.format(k + 1)] = torch.numel(lm_ranks_base[lm_ranks_base <= (k + 1)]) + base_lm_results.get('hits@{}'.format(k + 1), 0.0)
 
-                
                 scores_pred, scores_output, type_aware_stats = self.type_aware_module.apply_type_aware(
                     pred, output, rel, obj
                 )
                 type_aware_stats_list.append(type_aware_stats)
 
-                
                 struc_ranks = 1 + torch.argsort(torch.argsort(scores_pred, dim=1, descending=True), dim=1, descending=False)[b_range, obj]
                 lm_ranks = 1 + torch.argsort(torch.argsort(scores_output, dim=1, descending=True), dim=1, descending=False)[b_range, obj]
 
@@ -559,11 +609,9 @@ class Runner(object):
                         lm_ranks[lm_ranks <= (k + 1)]) + lm_results.get(
                         'hits@{}'.format(k + 1), 0.0)
 
-            
             if self.enable_type_aware:
                 ret_combine = combine_results
                 if getattr(self.p, 'type_aware_nonintrusive', False):
-                    
                     ret_combine = base_combine_results
                 return ret_combine, struc_results, lm_results, base_combine_results, base_struc_results, base_lm_results, type_aware_stats_list
             else:
@@ -571,7 +619,6 @@ class Runner(object):
 
     def run_epoch(self, epoch):
 
-        
         try:
             if hasattr(self.p, 'warmup_epochs') and isinstance(self.p.warmup_epochs, int) and self.p.warmup_epochs > 0:
                 scale = min(1.0, max(1, epoch) / float(self.p.warmup_epochs))
@@ -593,23 +640,20 @@ class Runner(object):
 
         for step, batch in enumerate(train_iter):
             self.optimizer.zero_grad()
-            
             self.model.mi_Discs.eval()
             sub, rel, obj, label, text_ids, text_mask, pred_pos = self.read_batch(batch, 'train')
-
+            if getattr(self.p, 'disable_plm', False):
+                text_ids, text_mask, pred_pos = None, None, None
             pred, output, corr = self.model.forward(sub, rel, text_ids, text_mask, pred_pos, 'train')
 
             loss_struc = self.model.loss_fn(pred, label)
             loss_lm = self.model.loss_fn(output, label)
-            
             losses_struc.append(loss_struc.item())
             losses_lm.append(loss_lm.item())
 
-            
             if self.p.loss_weight:
                 loss_weighted_sum = self.model.loss_weight(loss_struc, loss_lm)
                 loss = loss_weighted_sum + self.p.alpha * corr
-            
             else:
                 loss = loss_struc + loss_lm + self.p.alpha * corr
 
@@ -618,8 +662,6 @@ class Runner(object):
             loss.backward()
             self.optimizer.step()
             losses.append(loss.item())
-            
-            
             for i in range(self.p.mi_epoch):
                 self.model.mi_Discs.train()
                 lld_loss = self.model.lld_best(sub, rel)
@@ -629,12 +671,10 @@ class Runner(object):
                 lld_losses.append(lld_loss.item())
 
             if step % 1000 == 0:
-                
                 print(
-                    '[E:{}| {}]: Total Loss:{:.5}, Train {} Loss:{:.5}, Train MASK Loss:{:.5}, Corr Loss:{:.5}\t{} \n \t Best Combine Valid MRR: {:.5} \t Best Struc Valid MRR: {:.5} \t Best LM Valid MRR: {:.5}'.format(
-                        epoch, step, np.mean(losses), self.p.score_func, np.mean(losses_struc), np.mean(losses_lm), np.mean(corr_losses), self.p.name, self.best_val_mrr['combine'], self.best_val_mrr['struc'], self.best_val_mrr['text']))
+                    '[E:{}| {}]: Total Loss:{:.5}, Train {} Loss:{:.5}, Train MASK Loss:{:.5}, Corr Loss:{:.5}\t{} \n \t Best Combine Valid MRR: {:.5}'.format(
+                        epoch, step, np.mean(losses), self.p.score_func, np.mean(losses_struc), np.mean(losses_lm), np.mean(corr_losses), self.p.name, self.best_val_mrr['combine']))
         loss = np.mean(losses_struc)
-        
         loss_corr = np.mean(corr_losses)
         if self.p.mi_method.startswith('club') and self.p.mi_epoch == 1:
             loss_lld = np.mean(lld_losses)
@@ -655,9 +695,7 @@ class Runner(object):
             torch.save({
                 'state_dict': self.model.state_dict(),
                 'best_val_mrr': self.best_val_mrr[type],
-                
                 'optimizer': self.optimizer.state_dict(),
-                
             }, save_path)
 
     def fit(self):
@@ -668,7 +706,6 @@ class Runner(object):
                 kill_cnt = 0
                 for epoch in range(self.p.load_epoch+1, self.p.max_epochs+1):
                     train_loss, corr_loss, lld_loss = self.run_epoch(epoch)
-                    
                     combine_val_results, struc_val_results, lm_val_results = self.evaluate('valid', epoch)
                     if combine_val_results['mrr'] <= self.best_val_mrr['combine']:
                         kill_cnt += 1
@@ -683,23 +720,19 @@ class Runner(object):
                     self.save_model(combine_val_results, 'combine', epoch)
                     self.save_model(struc_val_results, 'struc', epoch)
                     self.save_model(lm_val_results, 'text', epoch)
-                    
                     if self.p.mi_method == 'club_s' or self.p.mi_method == 'club_b':
                         print(
-                            '[Epoch {}]: Training Loss: {:.5}, corr Loss: {:.5}, lld loss :{:.5}, \n \t Best Combine Valid MRR: {:.5} \n \t Best Struc Valid MRR: {:.5} \n \tBest LM Valid MRR: {:.5}\n\n'.format(
+                            '[Epoch {}]: Training Loss: {:.5}, corr Loss: {:.5}, lld loss :{:.5}, \n \t Best Combine Valid MRR: {:.5}\n\n'.format(
                                 epoch, train_loss, corr_loss,
-                                lld_loss, self.best_val_mrr['combine'], self.best_val_mrr['struc'], self.best_val_mrr['text']))
+                                lld_loss, self.best_val_mrr['combine']))
                     else:
                         print(
-                            '[Epoch {}]: Training Loss: {:.5}, corr Loss: {:.5}, \n\t Best Combine Valid MRR: {:.5} \n \tBest Struc Valid MRR: {:.5} \n \tBest LM Valid MRR: {:.5}\n\n'.format(
+                            '[Epoch {}]: Training Loss: {:.5}, corr Loss: {:.5}, \n\t Best Combine Valid MRR: {:.5}\n\n'.format(
                                 epoch, train_loss, corr_loss,
-                                self.best_val_mrr['combine'], self.best_val_mrr['struc'], self.best_val_mrr['text']))
+                                self.best_val_mrr['combine']))
 
             else:
-                
-                
                 print('Loading best model, Evaluating on Test data')
-                
                 self.evaluate('test', self.best_epoch[self.p.load_type])
         except Exception as e:
             print ("%s____%s\n"
@@ -716,7 +749,6 @@ if __name__ == '__main__':
     parser.add_argument('-score_func', dest='score_func', default='conve', help='Score Function for Link prediction')
     parser.add_argument('-opn', dest='opn', default='cross', help='Composition Operation to be used in RAGAT')
     parser.add_argument('-loss_weight', dest='loss_weight', action='store_true', help='whether to use weighted loss')
-    
     parser.add_argument('-batch', dest='batch_size', default=2048, type=int, help='Batch size')
     parser.add_argument('-test_batch', dest='test_batch_size', default=2048, type=int,
                         help='Batch size of valid and test data')
@@ -736,7 +768,6 @@ if __name__ == '__main__':
     parser.add_argument('-gcn_drop', dest='dropout', default=0.4, type=float, help='Dropout to use in GCN Layer')
     parser.add_argument('-hid_drop', dest='hid_drop', default=0.3, type=float, help='Dropout after GCN')
 
-    
     parser.add_argument('-hid_drop2', dest='hid_drop2', default=0.3, type=float, help='ConvE: Hidden dropout')
     parser.add_argument('-feat_drop', dest='feat_drop', default=0.3, type=float, help='ConvE: Feature Dropout')
     parser.add_argument('-k_w', dest='k_w', default=12, type=int, help='ConvE: k_w')
@@ -769,8 +800,6 @@ if __name__ == '__main__':
                         help='Composition Operation to be used in RAGAT')
     parser.add_argument('-gpu', type=int, default=6, help='Set GPU Ids : Eg: For CPU = -1, For Single GPU = 0')
 
-    
-    
     parser.add_argument('-pretrained_model', type=str, default='bert_large', help='Preset name (bert_large/roberta_large/...) or local path to model dir')
     parser.add_argument('-pretrained_model_name', type=str, default='bert_large', help='')
     parser.add_argument('-prompt_hidden_dim', default=-1, type=int, help='')
@@ -782,94 +811,145 @@ if __name__ == '__main__':
     parser.add_argument('-load_path', type=str, default=None)
     parser.add_argument('-test', dest='test', action='store_true', help='test the model')
     parser.add_argument('-unfreeze_layer', type=int, default=0)
-    
     parser.add_argument('-warmup_epochs', type=int, default=0, help='Linear warm-up epochs for learning rate')
-    
     
     parser.add_argument('--dynamic_hops', action='store_true', help='Enable confidence-based dynamic hops')
     parser.add_argument('-confidence_threshold', dest='confidence_threshold', type=float, default=0.8, help='Confidence threshold for dynamic hops')
-    parser.add_argument('-hop1_threshold', dest='hop1_threshold', type=float, default=0.5, help='Confidence threshold for 1-hop (>= this value means 1-hop)')
-    parser.add_argument('-hop2_threshold', dest='hop2_threshold', type=float, default=0.4, help='Confidence threshold for 2-hop (>= this value and < hop1_threshold means 2-hop)')
-    parser.add_argument('-hop3_threshold', dest='hop3_threshold', type=float, default=0.3, help='Confidence threshold for 3-hop (>= this value and < hop2_threshold means 3-hop, effective when 3+ hops are allowed)')
-    parser.add_argument('-hop4_threshold', dest='hop4_threshold', type=float, default=0.2, help='Confidence threshold for 4-hop (>= this value and < hop3_threshold means 4-hop, effective when 4+ hops are allowed)')
+    parser.add_argument('-hop1_threshold', dest='hop1_threshold', type=float, default=0.5, help='Confidence threshold for 1 hop (>= this value means 1 hop)')
+    parser.add_argument('-hop2_threshold', dest='hop2_threshold', type=float, default=0.4, help='Confidence threshold for 2 hops (>= this value and < hop1_threshold means 2 hops)')
+    parser.add_argument('-hop3_threshold', dest='hop3_threshold', type=float, default=0.3, help='Confidence threshold for 3 hops (>= this value and < hop2_threshold means 3 hops, effective when 3+ hops are allowed)')
+    parser.add_argument('-hop4_threshold', dest='hop4_threshold', type=float, default=0.2, help='Confidence threshold for 4 hops (>= this value and < hop3_threshold means 4 hops, effective when 4+ hops are allowed)')
     parser.add_argument('-max_hops', dest='max_hops', type=int, default=3, help='Maximum hop limit for dynamic hops, should not exceed GCN layers, supports up to 5 hops')
-    parser.add_argument('--print_conf_stats', action='store_true', help='Print min/max/avg confidence and 1/2/3-hop sample counts and ratios')
-    parser.add_argument('--grouped_backward', action='store_true', help='Group backward by hop to reduce memory peak')
-    parser.add_argument('--enable_amp', dest='enable_amp', action='store_true', help='Enable automatic mixed precision AMP')
+    parser.add_argument('--print_conf_stats', action='store_true', help='Print min/max/avg confidence and 1/2/3 hop sample counts and ratios')
+    parser.add_argument('--grouped_backward', action='store_true', help='Group by hop and backpropagate in segments to reduce memory peak')
+    parser.add_argument('--enable_amp', dest='enable_amp', action='store_true', help='Enable Automatic Mixed Precision (AMP)')
     parser.add_argument('--grad_clip_norm', type=float, default=0.0, help='Gradient clipping threshold (L2 norm), 0 means no clipping')
-    
     parser.add_argument('--confidence_loss_weight', type=float, default=0.0, help='Confidence auxiliary loss weight (0 means disable supervision)')
     parser.add_argument('--confidence_hidden_dim', type=int, default=128, help='Hidden dimension of confidence estimator')
-    
+    parser.add_argument('--disable_plm', action='store_true', help='Disable PLM branch, only use structure branch for scoring (for quick testing)')
     
     parser.add_argument('--enable_type_aware', dest='enable_type_aware', action='store_true', help='Enable type-aware evaluation')
     parser.add_argument('--report_type_aware_effect', dest='report_type_aware_effect', action='store_true', help='Report type-aware effect comparison')
-    parser.add_argument('--type_aware_nonintrusive', action='store_true', help='Do not change main evaluation/save: type-aware only for reporting (main results keep baseline)')
-    parser.add_argument('--type_soft_constraint', action='store_true', help='Apply type-aware as soft constraint (force soft mask, no hard clipping)')
+    parser.add_argument('--type_aware_nonintrusive', action='store_true', help='Do not change main evaluation/save: type-aware only for reporting (main results remain baseline)')
+    parser.add_argument('--type_soft_constraint', action='store_true', help='Apply type-aware in soft constraint mode (force soft mask, no hard clipping)')
     parser.add_argument('--type_soft_alpha', type=float, default=None, help='Prior strength upper limit under soft constraint (if specified, apply min clipping to type_prior_alpha)')
-    
     parser.add_argument('--type_prior_mode', type=str, default='add', choices=['add', 'mul'], help='Type prior injection mode: add for additive bias, mul for log-domain multiplication')
     parser.add_argument('--type_prior_alpha', type=float, default=0.3, help='Type prior strength coefficient')
     parser.add_argument('--type_prior_tau', type=float, default=1.0, help='Type prior temperature scaling')
     parser.add_argument('--type_prior_eps', type=float, default=1e-6, help='Laplace smoothing term')
-    parser.add_argument('--type_prior_zero_mean', action='store_true', help='Zero-mean the prior bias for each relation to avoid global shift affecting thresholds')
-    
+    parser.add_argument('--type_prior_zero_mean', action='store_true', help='Zero-mean the prior bias for each relation to avoid overall translation affecting thresholds')
     parser.add_argument('--type_mask_mode', type=str, default='soft', choices=['soft', 'none'], help='Type mask strategy: soft for soft penalty, none for disabled')
-    parser.add_argument('--type_mask_penalty', type=float, default=1.0, help='Penalty magnitude of soft mask for illegal entities')
-    
-    
+    parser.add_argument('--type_mask_penalty', type=float, default=1.0, help='Soft mask penalty magnitude for illegal entities')
     parser.set_defaults(print_conf_stats=False, grouped_backward=False, report_type_aware_effect=False, type_prior_zero_mean=False)
     args = parser.parse_args()
 
     if args.load_path == None and args.load_epoch == 0 and args.load_type == '':
-        
         args.name = args.name + '_' + time.strftime('%d_%m_%Y') + '_' + time.strftime('%H-%M-%S')
 
-    
-    
     args.pretrained_model_name = args.pretrained_model
 
-    
-    
     orig_pretrained_model_name = args.pretrained_model_name
-    
     if args.pretrained_model in ['bert_large', 'bert_base', 'roberta_large', 'roberta_base']:
         preset = args.pretrained_model
+        base_dir = os.path.dirname(__file__)
         if preset == 'bert_large':
-            args.pretrained_model = '/home/zjlab/gengyx/LMs/BERT_large'
+            # Try local paths first, then fallback to server path
+            local_dir_primary = os.path.join(base_dir, 'bert_base')  # Use bert_base for bert_large if available
+            local_dir_secondary = os.path.join(base_dir, '..', 'KnowledgeGraphEmbedding-master', 'bert_base')
+            server_path = '/home/zjlab/gengyx/LMs/BERT_large'
+            if os.path.isdir(local_dir_primary):
+                args.pretrained_model = local_dir_primary
+            elif os.path.isdir(local_dir_secondary):
+                args.pretrained_model = local_dir_secondary
+            elif os.path.isdir(server_path):
+                args.pretrained_model = server_path
+            else:
+                args.pretrained_model = local_dir_primary  # Default to local path
         elif preset == 'bert_base':
-            local_dir_primary = os.path.join(os.path.dirname(__file__), 'bert_base')
-            local_dir_secondary = os.path.join(os.path.dirname(__file__), '..', 'KnowledgeGraphEmbedding-master', 'bert_base')
-            args.pretrained_model = local_dir_primary if os.path.isdir(local_dir_primary) else local_dir_secondary
+            # Prioritize local relative paths
+            local_dir_primary = os.path.join(base_dir, 'bert_base')
+            local_dir_secondary = os.path.join(base_dir, '..', 'KnowledgeGraphEmbedding-master', 'bert_base')
+            if os.path.isdir(local_dir_primary):
+                args.pretrained_model = local_dir_primary  # Use relative path
+                print(f"[Info] Using local bert_base at: {args.pretrained_model}")
+            elif os.path.isdir(local_dir_secondary):
+                args.pretrained_model = local_dir_secondary
+                print(f"[Info] Using bert_base from parent directory: {args.pretrained_model}")
+            else:
+                args.pretrained_model = local_dir_primary  # Default to local path
+                print(f"[Warning] bert_base not found at {local_dir_primary}, will try HuggingFace or fail")
         elif preset == 'roberta_large':
-            args.pretrained_model = '/home/zjlab/gengyx/LMs/RoBERTa_large'
+            # Try local paths first, then fallback to server path
+            local_dir_primary = os.path.join(base_dir, 'roberta_base')
+            local_dir_secondary = os.path.join(base_dir, '..', 'KnowledgeGraphEmbedding-master', 'roberta_base')
+            server_path = '/home/zjlab/gengyx/LMs/RoBERTa_large'
+            if os.path.isdir(local_dir_primary):
+                args.pretrained_model = local_dir_primary  # Use relative path
+            elif os.path.isdir(local_dir_secondary):
+                args.pretrained_model = local_dir_secondary
+            elif os.path.isdir(server_path):
+                args.pretrained_model = server_path
+            else:
+                args.pretrained_model = local_dir_primary  # Default to local path
         elif preset == 'roberta_base':
-            local_dir_primary = os.path.join(os.path.dirname(__file__), 'roberta_base')
-            local_dir_secondary = os.path.join(os.path.dirname(__file__), '..', 'KnowledgeGraphEmbedding-master', 'roberta_base')
-            args.pretrained_model = local_dir_primary if os.path.isdir(local_dir_primary) else local_dir_secondary
+            # Prioritize local relative paths
+            local_dir_primary = os.path.join(base_dir, 'roberta_base')
+            local_dir_secondary = os.path.join(base_dir, '..', 'KnowledgeGraphEmbedding-master', 'roberta_base')
+            if os.path.isdir(local_dir_primary):
+                args.pretrained_model = local_dir_primary  # Use relative path
+            elif os.path.isdir(local_dir_secondary):
+                args.pretrained_model = local_dir_secondary
+            else:
+                args.pretrained_model = local_dir_primary  # Default to local path
     
+    # Check if local model directory exists
+    local_dir_exists = os.path.isdir(args.pretrained_model)
+    config_exists = os.path.exists(os.path.join(args.pretrained_model, 'config.json')) if local_dir_exists else False
+    
+    if not local_dir_exists:
+        # Directory doesn't exist
+        raise ValueError(f"Model directory not found at: {args.pretrained_model}\n"
+                        f"Please ensure the model directory exists. Expected paths:\n"
+                        f"  - {os.path.join(os.path.dirname(__file__), 'bert_base')}\n"
+                        f"  - {os.path.join(os.path.dirname(__file__), '..', 'KnowledgeGraphEmbedding-master', 'bert_base')}\n"
+                        f"Current working directory: {os.getcwd()}\n"
+                        f"Script directory: {os.path.dirname(__file__)}")
+    
+    if not config_exists:
+        # Directory exists but config.json is missing - try to load anyway (might be in cache or different structure)
+        print(f"[Warning] config.json not found in {args.pretrained_model}, but directory exists. Trying to load model...")
+    
+    # Try to load config - use local_files_only only if we're sure it's a local path (not HuggingFace ID)
+    is_hf_id = args.pretrained_model in ['bert-base-uncased', 'bert-large-uncased', 'roberta-base', 'roberta-large']
     try:
-        need_fallback = (not os.path.isdir(args.pretrained_model)) or (not os.path.exists(os.path.join(args.pretrained_model, 'config.json')))
-        if need_fallback:
-            hf_id_map = {
-                'bert_large': 'bert-large-uncased',
-                'bert_base': 'bert-base-uncased',
-                'roberta_large': 'roberta-large',
-                'roberta_base': 'roberta-base',
-            }
-            
-            if args.pretrained_model_name in hf_id_map:
-                args.pretrained_model = hf_id_map[args.pretrained_model_name]
-    except Exception:
-        pass
-    args.vocab_size = AutoConfig.from_pretrained(args.pretrained_model).vocab_size
-    args.model_dim = AutoConfig.from_pretrained(args.pretrained_model).hidden_size
+        if is_hf_id:
+            # This is a HuggingFace ID, but we'll try with local_files_only=False as fallback
+            # (though it should have been caught earlier)
+            print(f"[Warning] Using HuggingFace ID {args.pretrained_model}, this may require network connection")
+            args.vocab_size = AutoConfig.from_pretrained(args.pretrained_model, local_files_only=False).vocab_size
+            args.model_dim = AutoConfig.from_pretrained(args.pretrained_model, local_files_only=False).hidden_size
+        else:
+            # Local path - try with local_files_only first, then without if it fails
+            try:
+                args.vocab_size = AutoConfig.from_pretrained(args.pretrained_model, local_files_only=True).vocab_size
+                args.model_dim = AutoConfig.from_pretrained(args.pretrained_model, local_files_only=True).hidden_size
+                print(f"[Info] Successfully loaded model config from local path: {args.pretrained_model}")
+            except Exception as local_error:
+                # If local_files_only fails, try without it (might be in HuggingFace cache)
+                print(f"[Warning] Failed with local_files_only=True, trying without: {local_error}")
+                args.vocab_size = AutoConfig.from_pretrained(args.pretrained_model, local_files_only=False).vocab_size
+                args.model_dim = AutoConfig.from_pretrained(args.pretrained_model, local_files_only=False).hidden_size
+                print(f"[Info] Successfully loaded model config (may be from cache): {args.pretrained_model}")
+    except Exception as e:
+        raise ValueError(f"Failed to load model config from: {args.pretrained_model}\n"
+                        f"Error: {e}\n"
+                        f"Directory exists: {local_dir_exists}, config.json exists: {config_exists}\n"
+                        f"Please check that the model directory contains the required files (config.json, pytorch_model.bin, etc.)")
     if args.prompt_hidden_dim == -1:
         args.prompt_hidden_dim = args.embed_dim // 2
 
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
-    
     if torch.cuda.is_available() and isinstance(args.gpu, int) and args.gpu >= 0:
         torch.cuda.manual_seed_all(args.seed)
         torch.cuda.set_device(args.gpu)
@@ -877,14 +957,13 @@ if __name__ == '__main__':
     else:
         print("Using CPU.")
 
-    
-    if getattr(args, 'dynamic_hops', False) or (hasattr(args, 'model') and str(args.model).lower() == 'dynamic_multihop'):
+    if getattr(args, 'dynamic_hops', False) or (hasattr(args, 'model') and str(args.model).lower() == 'adaptive_multihop'):
         try:
-            from adaptive_multihop import create_dynamic_multihop_runner
-            print('[Info] Using DynamicMultiHopRunner to enable dynamic hops and confidence auxiliary loss')
-            model = create_dynamic_multihop_runner(args)
+            from adaptive_multihop import create_adaptive_multihop_runner
+            print('[Info] Using AdaptiveMultiHopRunner to enable adaptive hops and confidence auxiliary loss')
+            model = create_adaptive_multihop_runner(args)
         except Exception as e:
-            print(f"[Warning] Dynamic multi-hop runner creation failed, falling back to standard Runner: {e}")
+            print(f"[Warning] Failed to create adaptive multi-hop runner, falling back to standard Runner: {e}")
             model = Runner(args)
     else:
         model = Runner(args)

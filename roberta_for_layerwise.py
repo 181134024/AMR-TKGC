@@ -72,11 +72,7 @@ class RobertaEncoder(nn.Module):
             past_key_value = past_key_values[i] if past_key_values is not None else None
 
             if self.gradient_checkpointing and self.training:
-
                 if use_cache:
-                    logger.warning(
-                        "`use_cache=True` is incompatible with gradient checkpointing. Setting `use_cache=False`..."
-                    )
                     use_cache = False
 
                 def create_custom_forward(module):
@@ -153,8 +149,6 @@ class RobertaModelForLayerwise(RobertaPreTrainedModel):
         self.encoder = RobertaEncoder(config)
 
         self.pooler = RobertaPooler(config) if add_pooling_layer else None
-
-        
         self.post_init()
 
     def get_input_embeddings(self):
@@ -207,7 +201,6 @@ class RobertaModelForLayerwise(RobertaPreTrainedModel):
         batch_size, seq_length = input_shape
         device = input_ids.device if input_ids is not None else inputs_embeds.device
 
-        
         past_key_values_length = past_key_values[0][0].shape[2] if past_key_values is not None else 0
 
         if attention_mask is None:
@@ -221,12 +214,8 @@ class RobertaModelForLayerwise(RobertaPreTrainedModel):
             else:
                 token_type_ids = torch.zeros(input_shape, dtype=torch.long, device=device)
 
-        
-        
         extended_attention_mask: torch.Tensor = self.get_extended_attention_mask(attention_mask, input_shape, device)
 
-        
-        
         if self.config.is_decoder and encoder_hidden_states is not None:
             encoder_batch_size, encoder_sequence_length, _ = encoder_hidden_states.size()
             encoder_hidden_shape = (encoder_batch_size, encoder_sequence_length)
@@ -236,11 +225,6 @@ class RobertaModelForLayerwise(RobertaPreTrainedModel):
         else:
             encoder_extended_attention_mask = None
 
-        
-        
-        
-        
-        
         head_mask = self.get_head_mask(head_mask, self.config.num_hidden_layers)
 
         embedding_output = self.embeddings(

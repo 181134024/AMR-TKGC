@@ -16,7 +16,7 @@ class DisenLayer(MessagePassing):
         self.device = None
         self.head_num = head_num
         self.num_rels = num_rels
-        
+        # params for init
         self.drop = torch.nn.Dropout(self.p.dropout)
         self.dropout = torch.nn.Dropout(0.3)
         self.bn = torch.nn.BatchNorm1d(self.p.num_factors * out_channels)
@@ -55,10 +55,15 @@ class DisenLayer(MessagePassing):
         return entity1, torch.matmul(rel_embed, self.w_rel)[:-1]
 
     def message(self, edge_index_i, edge_index_j, x_i, x_j, edge_type, rel_embed, rel_weight):
+        '''
+        edge_index_i : [E]
+        x_i: [E, K, F]
+        x_j: [E, K, F]
+        '''
         rel_embed = torch.index_select(rel_embed, 0, edge_type)
         rel_weight = torch.index_select(rel_weight, 0, edge_type)
         xj_rel = self.rel_transform(x_j, rel_embed, rel_weight)
-        
+        # start to compute the attention
         alpha = self._get_attention(edge_index_i, edge_index_j, x_i, x_j, rel_embed, rel_weight, xj_rel)
         alpha = self.drop(alpha)
 
@@ -69,7 +74,7 @@ class DisenLayer(MessagePassing):
 
     def _get_attention(self, edge_index_i, edge_index_j, x_i, x_j, rel_embed, rel_weight, mes_xj):
         if self.p.att_mode == 'learn':
-            alpha = self.leakyrelu(torch.einsum('ekf, xkf->ek', [mes_xj, self.att_weight])) 
+            alpha = self.leakyrelu(torch.einsum('ekf, xkf->ek', [mes_xj, self.att_weight])) # [E K]
             alpha = softmax(alpha, edge_index_i, num_nodes=self.p.num_ent)
 
         elif self.p.att_mode == 'dot_weight':

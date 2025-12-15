@@ -32,6 +32,18 @@ class ConvE(nn.Module):
         head_emb = head_emb.view(-1, self.configs.embed_dim)
         rel_emb = rel_emb.view(-1, self.configs.embed_dim)
         stk_inp = self.concat(head_emb, rel_emb)
+        
+        # Handle batch size = 1 for BatchNorm
+        batch_size = stk_inp.size(0)
+        if batch_size == 1:
+            # Temporarily set BatchNorm to eval mode for batch size 1
+            bn0_was_training = self.bn0.training
+            bn1_was_training = self.bn1.training
+            bn2_was_training = self.bn2.training
+            self.bn0.eval()
+            self.bn1.eval()
+            self.bn2.eval()
+        
         x = self.bn0(stk_inp)
         x = self.m_conv1(x)
         x = self.bn1(x)
@@ -41,8 +53,17 @@ class ConvE(nn.Module):
         x = self.fc(x)
         x = self.hidden_drop(x)
         x = self.bn2(x)
-        x = F.relu(x)
         
+        # Restore BatchNorm training mode if needed
+        if batch_size == 1:
+            if bn0_was_training:
+                self.bn0.train()
+            if bn1_was_training:
+                self.bn1.train()
+            if bn2_was_training:
+                self.bn2.train()
+        
+        x = F.relu(x)
         x = x.view(-1, self.configs.num_factors, self.configs.embed_dim)
         return x
 
